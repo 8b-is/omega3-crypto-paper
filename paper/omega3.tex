@@ -1,0 +1,142 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+}
+
+\title{$\Omega_3$: Balanced-Ternary Encoding, Exact Dyadic Arithmetic,\\ and Capability-Sealed Reconciliation}
+\author{Peter Lodri\\ \small 8b-is $\times$ Vaked $\times$ Aurora}
+\date{2026-11}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We describe $\Omega_3$, a small family of primitives for representing and
+reconciling state in a distributed, capability-constrained system without
+floating-point drift and without ambient authority. The construction rests on
+three exact ideas: balanced-ternary packing of $\{-1,0,+1\}$ weights into
+\texttt{base-243} bytes at $1.585$ bits/trit; exact dyadic rationals
+$\mathbb{Z}[1/2]$ for all hot-path arithmetic; and a capability ABI in which
+every resource is addressed by an opaque 64-bit handle gated by a fixed set of
+checks, with a root-seal capability that can never be exported. We give the wire
+formats, the invariants, and the verified test vectors. Every claim is backed by
+a test in the reference implementation.
+\end{abstract}
+
+\section{Introduction}
+Distributed state reconciliation usually pays two taxes: \emph{precision}
+(floating point is not associative, so replicas drift) and \emph{authority} (a
+process that can name a resource can usually touch it). $\Omega_3$ removes both
+by construction: all state deltas are exact dyadic rationals $m/2^k$, closed
+under addition, subtraction, and the semilattice join; and all resource access
+is capability-mediated through a \texttt{VirtualCapHandle64} and a fixed 7-gate
+check.
+
+\section{Balanced-ternary packing (SPQT \texttt{base-243})}
+A balanced trit is $t\in\{-1,0,+1\}$; map it to $u=t+1\in\{0,1,2\}$. Five trits
+pack into one byte:
+\[
+B=\sum_{m=0}^{4} u_m\,3^m \in [0,242].
+\]
+Since $3^5=243\le 256$, every 5-trit group fits in a byte with codes
+$243..255$ reserved as invalid. Density is $\log_2 3\approx 1.585$ bits/trit.
+
+The reference packer is a single branchless helper:
+\begin{lstlisting}[language=Rust]
+#[inline]
+const fn pack_trit_chunk(trits: &[i8], start: usize, end: usize) -> u8 {
+    let mut byte_val = 0u8;
+    let mut pow3 = 1u8;
+    let mut k = start;
+    while k < end {
+        let t = trits[k];
+        let digit = ((t > 0) as u8) * 2 + ((t == 0) as u8);
+        byte_val = byte_val.wrapping_add(digit.wrapping_mul(pow3));
+        pow3 = pow3.wrapping_mul(3);
+        k += 1;
+    }
+    byte_val
+}
+\end{lstlisting}
+The digit map is bit-identical to the reference \texttt{if/else} for every
+\texttt{i8}, proven by an exhaustive test over \texttt{i8::MIN..=i8::MAX}.
+
+\subsection{The \texttt{LitanyWireFrame}}
+Integrity is carried by a 64-byte, cache-line-aligned frame. The 64-bit fold is
+partitioned into disjoint positive/negative bitplanes by the \texttt{qt} mask
+($\text{pos}\wedge\text{neg}=0$), and the frame is sealed by a 16-bit XOR over
+its first 62 bytes. The canonical fold at \texttt{qt:55}, gate \texttt{0x62} is
+\texttt{0xe1034e575c371ab0}, split into
+$\text{pos}=\texttt{0x4101445554151010}$,
+$\text{neg}=\texttt{0xa0020a0208220aa0}$.
+
+\section{Exact dyadic arithmetic ($\mathbb{Z}[1/2]$)}
+A dyadic rational is $q=m/2^k$. With fixed scale $k=16$ we store $q$ as a single
+\texttt{i64} mantissa. Addition and subtraction are integer add/sub (closed and
+exact); the semilattice join is $\max$. Because every operation stays inside
+$\mathbb{Z}[1/2]$ at a common scale, there is no rounding and no
+non-associativity: two replicas that apply the same deltas in any order reach
+the same bits. Compression ratios are exact: \texttt{RationalPQ\{p,q\}} with
+$\gcd(p,q)=1$.
+
+\section{Capability ABI}
+Every host resource is addressed by an opaque
+\texttt{VirtualCapHandle64} $=(\text{epoch\_gen},\text{cap\_slot\_id},
+\text{futhark\_tag\_r2},\text{block\_offset})$. A guest invokes resources only
+through \texttt{Op::Cap(handle, op, args)}. The host resolves the handle through
+a capability table gated by seven checks: alignment; Charm XVIII
+(\texttt{CAP\_ROOT\_SEAL} never exported); ternary polarity
+($\{-1{:}\text{guard},0{:}\text{RO},+1{:}\text{RW}\}$); epoch match (no
+use-after-free across hot-swap); Futhark tag ($3^3=27$); carry-safe slice
+bounds; and subset authorization
+$(\text{req}\wedge\text{allowed})=\text{req}$.
+
+\section{DEC / Cartan-torsion reconciliation}
+We model the execution history as an oriented cell complex and the
+reconciliation defect as a discrete Cartan torsion 2-cochain. The 0-cochains are
+replicated state vectors; the 1-cochains are the soldering form
+$\theta([v_i,v_j])=s(v_j)-s(v_i)$; the 2-cochains are the torsion
+$T(\sigma)=\oint_{\partial\sigma}\theta$. The join $\sqcup$ (element-wise
+$\sup$) is the retraction that absorbs the defect into a confluent state, after
+which discrete Stokes' theorem holds exactly: $\oint_{\partial\Sigma}\theta=0$.
+Because the arithmetic is dyadic, this closure is bit-exact.
+
+\section{Verified test vectors}
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Property & Vector & Where \\
+\midrule
+SPQT 5-trit chunks & $242,0,121$ & \texttt{wupz-core} \\
+Canonical fold @ qt:55 & \texttt{0xe1034e575c371ab0} & \texttt{wupz-core} + Go \\
+BFP-64 split & pos/neg above & Go$\leftrightarrow$Rust parity \\
+Ternary quantizer & trits $[1,-1,0,1,-1,0,1,-1]$ & \texttt{upz} golden \\
+C ABI parity & fold \texttt{0xe7e59050171f1e25} & \texttt{abi\_smoke} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{What this is, and what it is not}
+This is a construction paper: it documents primitives that are built, tested, and
+shipped. It is not a claim to break any third party's cryptography, and it does
+not. The security value is structural honesty --- exact arithmetic, capability
+attenuation, and a witnessed encoding --- not cryptanalysis.
+
+\section{Conclusion}
+$\Omega_3$ shows that a distributed system can carry ternary-quantized state,
+reconcile it exactly, and gate every resource access, all without floating-point
+drift and without ambient authority. The primitives are small, the invariants are
+testable, and the seams (Rust $\leftrightarrow$ Zig $\leftrightarrow$ Go) are
+exercised rather than assumed.
+
+\end{document}
